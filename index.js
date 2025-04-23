@@ -37,15 +37,19 @@ function log(color, msg) {
 }
 
 function loadWallets() {
-  const wallets = [];
-  let i = 1;
-  while (process.env[`WALLET_PK_${i}`]) {
-    wallets.push(process.env[`WALLET_PK_${i}`]);
-    i++;
+  try {
+    const walletFile = fs.readFileSync('./.env', 'utf8');
+    const wallets = walletFile.split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#') && line.length === 66);
+    
+    if (wallets.length === 0) throw new Error('未在 .env 中找到钱包私钥');
+    log('green', `✅ 共加载 ${wallets.length} 个钱包`);
+    return wallets;
+  } catch (err) {
+    log('red', `❌ 加载钱包失败: ${err.message}`);
+    return [];
   }
-  if (wallets.length === 0) throw new Error('未在 .env 中找到钱包私钥');
-  log('green', `✅ 共加载 ${wallets.length} 个钱包`);
-  return wallets;
 }
 
 function loadProxies() {
@@ -70,11 +74,7 @@ function createAxios(proxy = null, referer = '') {
     },
   };
   if (proxy) {
-    if (proxy.startsWith('socks5://')) {
-      config.httpsAgent = new SocksProxyAgent(proxy);
-    } else {
-      config.httpsAgent = new HttpsProxyAgent(proxy.startsWith('http') ? proxy : `http://${proxy}`);
-    }
+    config.httpsAgent = new SocksProxyAgent(proxy);
   }
   return axios.create(config);
 }
@@ -135,32 +135,54 @@ async function executeSwap(wallet, provider, idx, swapIdx, proxy) {
 }
 
 async function reportSwap(addr, txHash, block, proxy) {
-  try {
-    const axiosInstance = createAxios(proxy);
-    const payload = {
-      userId: addr.toLowerCase(),
-      type: "swap",
-      txHash, fromToken: "PRIOR", toToken: "USDC",
-      fromAmount: "0.1", toAmount: "0.2", status: "completed", blockNumber: block
-    };
-    await axiosInstance.post("https://prior-protocol-testnet-priorprotocol.replit.app/api/transactions", payload);
-    log('green', '✅ Swap 已上报 API');
-  } catch (err) {
-    log('red', `❌ Swap 上报失败: ${err.message}`);
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount < maxRetries) {
+    try {
+      const axiosInstance = createAxios(proxy);
+      const payload = {
+        userId: addr.toLowerCase(),
+        type: "swap",
+        txHash, fromToken: "PRIOR", toToken: "USDC",
+        fromAmount: "0.1", toAmount: "0.2", status: "completed", blockNumber: block
+      };
+      await axiosInstance.post("https://prior-protocol-testnet-priorprotocol.replit.app/api/transactions", payload);
+      log('green', '✅ Swap 已上报 API');
+      return;
+    } catch (err) {
+      retryCount++;
+      log('yellow', `⚠️ Swap 上报失败 (尝试 ${retryCount}/${maxRetries}): ${err.message}`);
+      if (retryCount < maxRetries) {
+        await sleep(5000); // 等待5秒后重试
+      }
+    }
   }
+  log('red', `❌ Swap 上报失败，已重试 ${maxRetries} 次`);
 }
 
 // Mining 功能
 async function activateMining(addr, proxy) {
-  try {
-    const axiosInstance = createAxios(proxy, 'https://priornftstake.xyz/');
-    await axiosInstance.post('https://prior-stake-priorprotocol.replit.app/api/activate', {
-      walletAddress: addr.toLowerCase(), hasNFT: true
-    });
-    log('green', `✅ 激活成功: ${addr}`);
-  } catch (err) {
-    log('red', `❌ 激活失败: ${err.message}`);
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount < maxRetries) {
+    try {
+      const axiosInstance = createAxios(proxy, 'https://priornftstake.xyz/');
+      await axiosInstance.post('https://prior-stake-priorprotocol.replit.app/api/activate', {
+        walletAddress: addr.toLowerCase(), hasNFT: true
+      });
+      log('green', `✅ 激活成功: ${addr}`);
+      return;
+    } catch (err) {
+      retryCount++;
+      log('yellow', `⚠️ 激活失败 (尝试 ${retryCount}/${maxRetries}): ${err.message}`);
+      if (retryCount < maxRetries) {
+        await sleep(5000); // 等待5秒后重试
+      }
+    }
   }
+  log('red', `❌ 激活失败，已重试 ${maxRetries} 次`);
 }
 
 async function miningProcess(wallet, proxy, idx) {
@@ -168,15 +190,34 @@ async function miningProcess(wallet, proxy, idx) {
   log('cyan', `🔹 激活Mining: 钱包 #${idx + 1}`);
   try {
     await activateMining(addr, proxy);
-  } catch (e) {}
+    return true;
+  } catch (e) {
+    log('red', `❌ 激活失败: ${e.message}`);
+    return false;
+  }
 }
 
 async function startSwapSession(wallets, proxies, provider) {
   log('cyan', `🔁 开始一次 Swap 会话`);
   for (let i = 0; i < wallets.length; i++) {
-    const proxy = proxies[i % proxies.length];
-    const ok = await checkAndApproveToken(wallets[i], provider, i, proxy);
-    if (ok) await executeSwap(wallets[i], provider, i, i + 1, proxy);
+    let proxyIndex = i % proxies.length;
+    let success = false;
+    let retryCount = 0;
+    
+    while (!success && retryCount < proxies.length) {
+      const proxy = proxies[proxyIndex];
+      const ok = await checkAndApproveToken(wallets[i], provider, i, proxy);
+      if (ok) {
+        success = await executeSwap(wallets[i], provider, i, i + 1, proxy);
+      } else {
+        // 如果余额不足，直接跳出循环，继续下一个钱包
+        break;
+      }
+      if (!success) {
+        proxyIndex = (proxyIndex + 1) % proxies.length;
+        retryCount++;
+      }
+    }
     await sleep(10000 + Math.random() * 5000);
   }
 }
@@ -184,7 +225,20 @@ async function startSwapSession(wallets, proxies, provider) {
 async function startMiningActivation(wallets, proxies) {
   log('cyan', '🔁 开始激活所有钱包的 Mining');
   for (let i = 0; i < wallets.length; i++) {
-    await miningProcess(wallets[i], proxies[i % proxies.length], i);
+    let proxyIndex = i % proxies.length;
+    let success = false;
+    let retryCount = 0;
+    
+    while (!success && retryCount < proxies.length) {
+      const proxy = proxies[proxyIndex];
+      try {
+        await miningProcess(wallets[i], proxy, i);
+        success = true;
+      } catch (e) {
+        proxyIndex = (proxyIndex + 1) % proxies.length;
+        retryCount++;
+      }
+    }
     await sleep(3000 + Math.random() * 5000);
   }
 }
