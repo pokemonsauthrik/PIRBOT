@@ -93,7 +93,7 @@ async function checkAndApproveToken(wallet, provider, idx, proxy) {
     const formatted = ethers.utils.formatUnits(balance, decimals);
     log('white', `💰 PRIOR余额: ${formatted}`);
 
-    const amount = ethers.utils.parseUnits('0.1', decimals);
+    const amount = ethers.utils.parseUnits('0.01', decimals);
     if (balance.lt(amount)) {
       log('red', '❌ PRIOR余额不足，跳过');
       return false;
@@ -120,8 +120,12 @@ async function executeSwap(wallet, provider, idx, swapIdx, proxy) {
   const signer = new ethers.Wallet(wallet, provider);
   try {
     const token = new ethers.Contract(PRIOR_TOKEN, ERC20_ABI, signer);
-    const amount = ethers.utils.parseUnits('0.1', await token.decimals());
-    const data = '0x8ec7baf1000000000000000000000000000000000000000000000000016345785d8a0000';
+    const amount = ethers.utils.parseUnits('0.01', await token.decimals());
+    log('white', `💰 交易金额: 0.01 PRIOR`);
+    
+    // 计算新的data参数
+    const data = '0x8ec7baf1000000000000000000000000000000000000000000000000002386f26fc10000';
+    
     const tx = await signer.sendTransaction({ to: SWAP_ROUTER, data, gasLimit: 300000 });
     log('yellow', `🔄 Swap #${swapIdx} 已发出: ${tx.hash}`);
     const receipt = await tx.wait();
@@ -145,7 +149,7 @@ async function reportSwap(addr, txHash, block, proxy) {
         userId: addr.toLowerCase(),
         type: "swap",
         txHash, fromToken: "PRIOR", toToken: "USDC",
-        fromAmount: "0.1", toAmount: "0.2", status: "completed", blockNumber: block
+        fromAmount: "0.01", toAmount: "0.02", status: "completed", blockNumber: block
       };
       await axiosInstance.post("https://prior-protocol-testnet-priorprotocol.replit.app/api/transactions", payload);
       log('green', '✅ Swap 已上报 API');
@@ -199,26 +203,53 @@ async function miningProcess(wallet, proxy, idx) {
 
 async function startSwapSession(wallets, proxies, provider) {
   log('cyan', `🔁 开始一次 Swap 会话`);
+  const startTime = Date.now();
+  
   for (let i = 0; i < wallets.length; i++) {
-    let proxyIndex = i % proxies.length;
-    let success = false;
-    let retryCount = 0;
+    log('cyan', `🔹 开始处理钱包 #${i + 1}`);
     
-    while (!success && retryCount < proxies.length) {
-      const proxy = proxies[proxyIndex];
-      const ok = await checkAndApproveToken(wallets[i], provider, i, proxy);
-      if (ok) {
-        success = await executeSwap(wallets[i], provider, i, i + 1, proxy);
-      } else {
-        // 如果余额不足，直接跳出循环，继续下一个钱包
+    // 每个钱包交易5次
+    for (let swapCount = 0; swapCount < 5; swapCount++) {
+      let proxyIndex = i % proxies.length;
+      let success = false;
+      let retryCount = 0;
+      
+      log('cyan', `📝 开始第 ${swapCount + 1}/5 次交易`);
+      
+      while (!success && retryCount < proxies.length) {
+        const proxy = proxies[proxyIndex];
+        const ok = await checkAndApproveToken(wallets[i], provider, i, proxy);
+        if (ok) {
+          success = await executeSwap(wallets[i], provider, i, swapCount + 1, proxy);
+        } else {
+          log('red', '❌ 余额检查失败，跳过此钱包');
+          break;
+        }
+        if (!success) {
+          proxyIndex = (proxyIndex + 1) % proxies.length;
+          retryCount++;
+          log('yellow', `⚠️ 交易失败，尝试下一个代理 (${retryCount}/${proxies.length})`);
+        }
+      }
+      
+      if (!success) {
+        log('red', '❌ 所有代理都失败，跳过此钱包');
         break;
       }
-      if (!success) {
-        proxyIndex = (proxyIndex + 1) % proxies.length;
-        retryCount++;
-      }
+      
+      // 每次交易后随机休息1-8秒
+      const delay = 1000 + Math.random() * 7000;
+      log('yellow', `⏳ 等待 ${Math.round(delay / 1000)} 秒后继续...`);
+      await sleep(delay);
     }
-    await sleep(10000 + Math.random() * 5000);
+  }
+  
+  // 计算需要等待的时间，确保24小时后再次开始
+  const elapsedTime = Date.now() - startTime;
+  const waitTime = 24 * 60 * 60 * 1000 - elapsedTime;
+  if (waitTime > 0) {
+    log('cyan', `⏳ 所有钱包交易完成，等待 ${Math.round(waitTime / 1000 / 60)} 分钟后开始下一轮`);
+    await sleep(waitTime);
   }
 }
 
@@ -245,19 +276,31 @@ async function startMiningActivation(wallets, proxies) {
 
 // 主逻辑入口
 (async () => {
-  log('cyan', '🚀 PRIOR 一体化脚本启动');
-  const wallets = loadWallets();
-  const proxies = loadProxies();
-  const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+  try {
+    log('cyan', '🚀 PRIOR 一体化脚本启动');
+    const wallets = loadWallets();
+    const proxies = loadProxies();
+    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
 
-  await startMiningActivation(wallets, proxies);
-  await startSwapSession(wallets, proxies, provider);
-
-  log('green', '✅ 初次运行完成。将持续轮询...');
-  while (true) {
-    await sleep(12 * 60 * 60 * 1000); // 每12小时执行一次
+    // 先执行Mining激活
     await startMiningActivation(wallets, proxies);
-    await sleep(5 * 60 * 1000);
-    await startSwapSession(wallets, proxies, provider);
+    
+    // 等待1分钟后开始Swap
+    log('yellow', '⏳ 等待1分钟后开始Swap交易...');
+    await sleep(60 * 1000);
+    
+    while (true) {
+      try {
+        // 执行Swap会话
+        log('cyan', '🔄 开始Swap交易会话');
+        await startSwapSession(wallets, proxies, provider);
+      } catch (err) {
+        log('red', `❌ Swap执行出错: ${err.message}`);
+        log('yellow', '⏳ 等待1分钟后重试...');
+        await sleep(60 * 1000);
+      }
+    }
+  } catch (err) {
+    log('red', `❌ 程序初始化失败: ${err.message}`);
   }
 })();
